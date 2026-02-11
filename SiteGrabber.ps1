@@ -1,32 +1,62 @@
 <#
 .SYNOPSIS
-    PowerShell convenience wrapper for SiteGrabber.
+    PowerShell wrapper for SiteGrabber; parameters map to Python sitegrabber CLI (--input-address, --output-folder, etc.).
 
 .DESCRIPTION
-    Calls the Python SiteGrabber module with the specified parameters.
-    Requires Python 3.10+ and the dependencies from requirements.txt.
+    Runs the Python SiteGrabber module (python -m sitegrabber) with the given options.
+    Requires Python 3.10+ and dependencies from requirements.txt.
+    Output folder passed to Python is OutputFolder plus a sanitized subfolder from InputAddress.
+
+.PARAMETER InputAddress
+    Required. Passed to Python as --input-address. Starting URL to crawl (e.g. a docs root).
+
+.PARAMETER OutputFolder
+    Base folder for saved pages. Default: user's Downloads\SiteGrabber. Python receives this plus a subfolder derived from InputAddress (illegal path chars removed) as --output-folder.
+
+.PARAMETER InputLimitationType
+    Optional. Passed to Python as --limitation-type. Attribute name to filter on when extracting links (e.g. class, id, aria-label). Only divs with this attribute matching InputLimitationText are used for links.
+
+.PARAMETER InputLimitationText
+    Optional. Passed to Python as --limitation-text. Text to match in div attributes. With InputLimitationType, restricts link extraction to matching divs; useful for doc sites (e.g. ibmdocs-toc-link).
+
+.PARAMETER Recursive
+    Default True. In Python: --recursive (follow links) or --no-recursive (single page only).
+
+.PARAMETER Delay
+    Default 0.5. Passed to Python as --delay. Seconds to wait between HTTP requests (rate limiting).
+
+.PARAMETER MaxPages
+    Default 0. Passed to Python as --max-pages. Maximum pages to download; 0 means unlimited.
+
+.PARAMETER Timeout
+    Default 30. Passed to Python as --timeout. Request timeout in seconds.
+
+.PARAMETER Resume
+    Switch. Passed to Python as --resume. Skips already-downloaded files and continues from existing output.
+
+.PARAMETER Verbose
+    Switch. Passed to Python as --verbose. Enables verbose logging (out-of-scope URLs, skipped content, etc.).
 
 .EXAMPLE
-    .\run.ps1 -InputAddress "https://www.ibm.com/docs/en/db2/12.1.x" -OutputFolder "C:\opt\data\SiteGrabber\ibm-db2"
+    .\SiteGrabber.ps1 -InputAddress "https://www.ibm.com/docs/en/db2/12.1.x"
+    Crawls from that URL; saves under Downloads\SiteGrabber\<sanitized-URL>.
 
 .EXAMPLE
-    .\run.ps1 -InputAddress "https://www.ibm.com/docs/en/db2/12.1.x" -OutputFolder "C:\opt\data\SiteGrabber\ibm-db2" -InputLimitationType "class" -InputLimitationText "ibmdocs-toc-link" -Recursive
+    .\SiteGrabber.ps1 -InputAddress "https://www.ibm.com/docs/en/db2/12.1.x" -OutputFolder "C:\opt\data\SiteGrabber" -InputLimitationType "class" -InputLimitationText "ibmdocs-toc-link" -Recursive
+    Same, with custom output base, HTML filter (only links inside divs with class ibmdocs-toc-link), and recursive crawl.
 #>
 
 param(
     [Parameter(Mandatory)]
     [string]$InputAddress,
 
-    [Parameter(Mandatory)]
-    [string]$OutputFolder,
+    [string]$OutputFolder = (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads\SiteGrabber'),
 
     [string]$InputLimitationType,
 
     [string]$InputLimitationText,
 
-    [switch]$Recursive,
-
-    [switch]$NoRecursive,
+    [bool]$Recursive = $true,
 
     [double]$Delay = 0.5,
 
@@ -34,9 +64,7 @@ param(
 
     [int]$Timeout = 30,
 
-    [switch]$Resume,
-
-    [switch]$Verbose
+    [switch]$Resume
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,7 +74,7 @@ $pythonExe = $null
 
 # Try py launcher first (handles version selection)
 $pyLauncher = Get-Command py -ErrorAction SilentlyContinue |
-    Select-Object -First 1 -ExpandProperty Source
+Select-Object -First 1 -ExpandProperty Source
 if ($pyLauncher) {
     $pythonExe = $pyLauncher
 }
@@ -62,20 +90,27 @@ if (-not $pythonExe) {
 # Try PATH (excluding WindowsApps stub)
 if (-not $pythonExe) {
     $pythonExe = Get-Command python -ErrorAction SilentlyContinue |
-        Where-Object { $_.Source -notlike '*WindowsApps*' } |
-        Select-Object -First 1 -ExpandProperty Source
+    Where-Object { $_.Source -notlike '*WindowsApps*' } |
+    Select-Object -First 1 -ExpandProperty Source
 }
 
 if (-not $pythonExe) {
     Write-Error "Python not found. Install Python 3.10+ and ensure it is on PATH."
     exit 1
 }
+# Subfolder from input-address with illegal path chars removed (Windows: \ / : * ? " < > |)
+$safeInputName = $InputAddress -replace '[<>:"/\\|?*]', '_' -replace '_+', '_' -replace '^[\s._]+|[\s._]+$', ''
+if (-not $safeInputName) { $safeInputName = 'sitegrabber' }
+$effectiveOutputFolder = Join-Path $OutputFolder $safeInputName
 
+if (-not (Test-Path $effectiveOutputFolder)) {
+    New-Item -ItemType Directory -Path $effectiveOutputFolder | Out-Null
+}
 # Build argument list
 $argList = @(
     '-m', 'sitegrabber',
     '--input-address', $InputAddress,
-    '--output-folder', $OutputFolder
+    '--output-folder', $effectiveOutputFolder
 )
 
 if ($InputLimitationType) {
@@ -86,9 +121,10 @@ if ($InputLimitationText) {
     $argList += '--limitation-text', $InputLimitationText
 }
 
-if ($NoRecursive) {
+if (-not $Recursive) {
     $argList += '--no-recursive'
-} elseif ($Recursive) {
+}
+elseif ($Recursive) {
     $argList += '--recursive'
 }
 

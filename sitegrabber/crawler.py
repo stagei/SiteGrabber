@@ -224,10 +224,21 @@ class Crawler:
         # Extract links from filtered content
         hrefs = extract_links(filtered_elements)
 
+        if self.config.verbose and hrefs:
+            print(f"  [DEBUG] Links found (raw hrefs): {len(hrefs)}")
+            for i, href in enumerate(hrefs, 1):
+                print(f"    {i}. {href}")
+
+        # Use base URL with trailing slash so relative hrefs resolve under current path (e.g. tutorial/index.html -> /3/tutorial/index.html)
+        base_for_resolve = page_url.rstrip("/") + "/" if "?" not in page_url and "#" not in page_url else page_url
+
         new_count = 0
+        queued: list[str] = []
         for href in hrefs:
-            resolved = resolve_url(page_url, href)
+            resolved = resolve_url(base_for_resolve, href)
             if not resolved:
+                if self.config.verbose:
+                    print(f"  [DEBUG] Skipped (unresolved): {href!r}")
                 continue
 
             if resolved in self.visited:
@@ -242,6 +253,12 @@ class Crawler:
             if resolved not in self.visited:
                 self.queue.append(resolved)
                 new_count += 1
+                queued.append(resolved)
+
+        if self.config.verbose and queued:
+            print(f"  [DEBUG] Resolved in-scope (queued): {len(queued)}")
+            for i, url in enumerate(queued, 1):
+                print(f"    {i}. {url}")
 
         if new_count > 0:
             print(f"  [LINKS] Found {len(hrefs)} links, queued {new_count} new in-scope URLs")
