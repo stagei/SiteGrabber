@@ -1,0 +1,31 @@
+---
+description: SiteGrabber project conventions — execution, testing, and validation rules
+alwaysApply: true
+---
+
+# SiteGrabber Conventions
+
+## Execution
+
+- Always run SiteGrabber through `SiteGrabber.ps1` as the proxy starter. Never invoke `python -m sitegrabber` directly.
+- The PS1 wrapper auto-installs pip dependencies and (when `-Browser` is used) Playwright Chromium — no manual setup needed.
+
+## Validation Benchmark
+
+- When crawling `https://www.ibm.com/docs/en/db2/12.1.x` recursively, SiteGrabber must retrieve **at least 300 HTML files** to be considered working correctly.
+- IBM Docs is a JavaScript-rendered SPA; use `-Browser` with `-InputLimitationType "aria-label"` and `-InputLimitationText "TOC navigation"` to expand the sidebar TOC tree on the first page and discover all topic URLs.
+- The limitation type/text only applies to the original input address. All subsequent pages use full-document link extraction.
+- If fewer than 300 files are saved, treat it as a bug — investigate TOC expansion, link extraction, scope filtering, or browser rendering.
+
+## Quick Reference
+
+```powershell
+# Static HTML sites
+.\SiteGrabber.ps1 -InputAddress "https://example.com/docs"
+
+# JS-rendered SPA sites (IBM Docs benchmark)
+.\SiteGrabber.ps1 -InputAddress "https://www.ibm.com/docs/en/db2/12.1.x" -Browser -InputLimitationType "aria-label" -InputLimitationText "TOC navigation"
+
+# With resume
+.\SiteGrabber.ps1 -InputAddress "https://www.ibm.com/docs/en/db2/12.1.x" -Browser -InputLimitationType "aria-label" -InputLimitationText "TOC navigation" -Resume
+```

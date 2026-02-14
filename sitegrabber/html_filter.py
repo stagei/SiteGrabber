@@ -138,11 +138,17 @@ def _filter_by_any_attribute(
     return matches
 
 
-def extract_links(elements: list) -> list[str]:
-    """Extract all href values from anchor tags within the given elements.
+def extract_links(elements: list, content_types: str = "html") -> list[str]:
+    """Extract href values from anchor tags within the given elements.
+
+    Filters links based on content_types:
+    - "html": Only non-PDF links (pages).
+    - "pdf":  Only links ending in .pdf.
+    - "all":  Both HTML page links and PDF links.
 
     Args:
         elements: List of BeautifulSoup Tag or BeautifulSoup objects.
+        content_types: What link types to extract: "html", "pdf", or "all".
 
     Returns:
         List of href strings (may contain relative or absolute URLs).
@@ -153,8 +159,18 @@ def extract_links(elements: list) -> list[str]:
     for element in elements:
         for anchor in element.find_all("a", href=True):
             href = anchor["href"].strip()
-            if href and href not in seen:
-                seen.add(href)
-                hrefs.append(href)
+            if not href or href in seen:
+                continue
+
+            is_pdf = href.lower().endswith(".pdf")
+
+            if content_types == "pdf" and not is_pdf:
+                continue
+            if content_types == "html" and is_pdf:
+                continue
+            # "all" accepts both
+
+            seen.add(href)
+            hrefs.append(href)
 
     return hrefs

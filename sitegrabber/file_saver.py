@@ -108,6 +108,30 @@ def save_page(filepath: str, content: str) -> bool:
         return False
 
 
+def save_binary(filepath: str, content: bytes) -> bool:
+    """Save binary content (e.g. PDF) to a file, creating directories as needed.
+
+    Args:
+        filepath: Full filesystem path for the file.
+        content: Raw bytes to write.
+
+    Returns:
+        True if saved successfully, False on error.
+    """
+    try:
+        directory = os.path.dirname(filepath)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        with open(filepath, "wb") as f:
+            f.write(content)
+
+        return True
+    except OSError as e:
+        print(f"  [ERROR] Failed to save {filepath}: {e}")
+        return False
+
+
 def file_exists(filepath: str) -> bool:
     """Check if a file already exists (for resume support).
 
@@ -118,6 +142,28 @@ def file_exists(filepath: str) -> bool:
         True if the file exists and has content.
     """
     return os.path.isfile(filepath) and os.path.getsize(filepath) > 0
+
+
+def pdf_url_to_filepath(url: str, output_folder: str) -> str:
+    """Map a PDF URL to a local filesystem path.
+
+    Uses the original filename from the URL path (e.g. db2_sec_guide.pdf).
+
+    Args:
+        url: Fully resolved PDF URL.
+        output_folder: Local filesystem folder for output.
+
+    Returns:
+        Absolute filesystem path for saving the PDF.
+    """
+    url_parsed = urlparse(url)
+    # Get the filename from the URL path
+    path = unquote(url_parsed.path)
+    filename = os.path.basename(path) or "download.pdf"
+    filename = _sanitize_filename(filename)
+    if not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
+    return os.path.join(output_folder, filename)
 
 
 def _sanitize_query(query: str) -> str:
@@ -145,6 +191,8 @@ def _sanitize_query(query: str) -> str:
 def _sanitize_filename(filename: str) -> str:
     """Remove or replace characters that are invalid in filenames.
 
+    Preserves the original extension (.html, .pdf, etc.).
+
     Args:
         filename: Proposed filename.
 
@@ -158,8 +206,9 @@ def _sanitize_filename(filename: str) -> str:
     # Ensure not empty
     if not sanitized:
         sanitized = "page.html"
-    # Ensure it ends with .html
-    if not sanitized.lower().endswith(".html"):
+    # Ensure it ends with a known extension
+    lower = sanitized.lower()
+    if not lower.endswith((".html", ".pdf")):
         sanitized += ".html"
     return sanitized
 

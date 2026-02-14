@@ -108,6 +108,37 @@ Examples:
         help="Enable verbose logging (shows out-of-scope URLs, skipped content types, etc.)",
     )
 
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        default=False,
+        help="Use headless Chromium browser (Playwright) for JS-rendered SPA sites. "
+             "Required for sites like IBM docs that load content via JavaScript.",
+    )
+
+    parser.add_argument(
+        "--wait-for",
+        default="domcontentloaded",
+        choices=["networkidle", "domcontentloaded", "load", "commit"],
+        help="Playwright wait condition before extracting HTML (default: domcontentloaded). "
+             "Only used with --browser.",
+    )
+
+    parser.add_argument(
+        "--extra-wait",
+        type=float,
+        default=5.0,
+        help="Seconds to wait after page load for JS to render dynamic content (default: 5.0). "
+             "Increase for heavy SPA sites. Only used with --browser.",
+    )
+
+    parser.add_argument(
+        "--content-types",
+        default="html",
+        choices=["html", "pdf", "all"],
+        help="What to download: html (default), pdf (only PDF links), all (both HTML pages and PDF files).",
+    )
+
     args = parser.parse_args(argv)
 
     return CrawlConfig(
@@ -121,6 +152,10 @@ Examples:
         timeout=args.timeout,
         resume=args.resume,
         verbose=args.verbose,
+        browser=args.browser,
+        wait_for=args.wait_for,
+        extra_wait=args.extra_wait,
+        content_types=args.content_types,
     )
 
 

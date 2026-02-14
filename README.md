@@ -14,13 +14,18 @@ Recursive website content downloader with smart URL resolution and HTML filterin
 ## Requirements
 
 - Python 3.10+
-- Dependencies: `requests`, `beautifulsoup4`, `lxml`
+- Dependencies: `requests`, `beautifulsoup4`, `lxml`, `playwright` (auto-installed)
 
 ## Installation
+
+No manual install needed — `SiteGrabber.ps1` automatically installs pip dependencies from `requirements.txt` on every run. When `-Browser` is used, Playwright Chromium is also auto-installed.
+
+If you prefer to install manually:
 
 ```powershell
 cd c:\opt\src\SiteGrabber
 pip install -r requirements.txt
+python -m playwright install chromium   # only needed for -Browser mode
 ```
 
 ## Usage
