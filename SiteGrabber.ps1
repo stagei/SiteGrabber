@@ -54,6 +54,17 @@
     Default 'html'. Passed to Python as --content-types. What to download:
     html = only HTML pages, pdf = only PDF file links, all = both HTML and PDF.
 
+.PARAMETER LoginUrl
+    Optional. Passed to Python as --login-url. URL of the login page.
+    When set, the browser navigates here first and authenticates before crawling.
+    Requires -Browser.
+
+.PARAMETER LoginEmail
+    Optional. Passed to Python as --login-email. Email or username for login.
+
+.PARAMETER LoginPassword
+    Optional. Passed to Python as --login-password. Password for login.
+
 .EXAMPLE
     .\SiteGrabber.ps1 -InputAddress "https://www.ibm.com/docs/en/db2/12.1.x"
     Crawls from that URL; saves under Downloads\SiteGrabber\<sanitized-URL>.
@@ -95,7 +106,13 @@ param(
     [double]$ExtraWait = 5.0,
 
     [ValidateSet('html', 'pdf', 'all')]
-    [string]$ContentTypes = 'html'
+    [string]$ContentTypes = 'html',
+
+    [string]$LoginUrl,
+
+    [string]$LoginEmail,
+
+    [string]$LoginPassword
 )
 
 $ErrorActionPreference = 'Stop'
@@ -224,6 +241,18 @@ if ($ExtraWait -ne 5.0) {
 
 if ($ContentTypes -ne 'html') {
     $argList += '--content-types', $ContentTypes
+}
+
+if ($LoginUrl) {
+    $argList += '--login-url', $LoginUrl
+}
+
+if ($LoginEmail) {
+    $argList += '--login-email', $LoginEmail
+}
+
+if ($LoginPassword) {
+    $argList += '--login-password', $LoginPassword
 }
 
 # Run SiteGrabber from the project directory so Python can find the module

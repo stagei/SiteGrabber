@@ -38,6 +38,7 @@ class Crawler:
         self.config = config
         self.queue: deque[str] = deque()
         self.visited: set[str] = set()
+        self.queued: set[str] = set()   # All URLs ever added to the queue (dedup)
         self.failed: dict[str, str] = {}
         self.saved_count: int = 0
         self._toc_expanded: bool = False  # True after TOC tree expansion on root page
@@ -65,6 +66,7 @@ class Crawler:
         """
         input_url = self.config.input_address.rstrip("/")
         self.queue.append(input_url)
+        self.queued.add(input_url)
 
         mode = "Browser (Playwright/Chromium)" if self.config.browser else "HTTP (requests)"
 
@@ -81,6 +83,9 @@ class Crawler:
         print(f"  Delay: {self.config.delay}s | Timeout: {self.config.timeout}s")
         if self.config.browser:
             print(f"  Extra wait: {self.config.extra_wait}s")
+        if self.config.login_url:
+            print(f"  Login URL: {self.config.login_url}")
+            print(f"  Login user: {self.config.login_email or '(not set)'}")
         if self.config.max_pages > 0:
             print(f"  Max pages: {self.config.max_pages}")
         if self.config.resume:
@@ -92,6 +97,14 @@ class Crawler:
         # Initialize browser if needed
         if self.config.browser:
             self._init_browser()
+
+            # Perform login before crawling if credentials are provided
+            if self.config.login_url and self.config.login_email and self.config.login_password:
+                self._browser_login()
+                # Transfer browser cookies to the requests session so
+                # subsequent pages can be fetched via fast HTTP instead
+                # of slow browser navigation.
+                self._transfer_browser_cookies()
 
         try:
             while self.queue:
@@ -117,15 +130,30 @@ class Crawler:
         self._print_summary()
 
     def _init_browser(self) -> None:
-        """Initialize Playwright headless Chromium browser."""
+        """Initialize Playwright Chromium browser.
+
+        When login credentials are provided, the browser launches in visible
+        (headed) mode so the site's bot-detection doesn't block the login form.
+        Otherwise it runs headless for speed.
+        """
         try:
             from playwright.sync_api import sync_playwright
-            print("[BROWSER] Starting headless Chromium...")
+            needs_login = bool(self.config.login_url and self.config.login_email)
+            headless = not needs_login
+            mode_label = "headed (login)" if needs_login else "headless"
+            print(f"[BROWSER] Starting Chromium ({mode_label})...")
             self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(headless=True)
+            self._browser = self._playwright.chromium.launch(
+                headless=headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
             self._browser_context = self._browser.new_context(
-                user_agent=self.config.user_agent,
+                user_agent=self.config.user_agent.replace("SiteGrabber/1.0", "").strip(),
                 viewport={"width": 1920, "height": 1080},
+            )
+            # Mask the webdriver property so sites don't detect automation
+            self._browser_context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
             self._page = self._browser_context.new_page()
             print("[BROWSER] Ready.\n")
@@ -159,26 +187,271 @@ class Crawler:
             except Exception:
                 pass
 
+    def _browser_login(self) -> None:
+        """Authenticate via the browser before crawling.
+
+        Navigates to config.login_url, fills in email/password fields, and
+        submits the form.  Waits for the login to complete by checking that
+        the URL has changed away from the login page.
+
+        Common login form patterns are tried in order:
+          1. input[type=email] / input[name*=email] / input[name*=user]
+          2. input[type=password]
+          3. button[type=submit] / input[type=submit] / button with "login"/"sign in" text
+        """
+        if self._page is None:
+            return
+
+        login_url = self.config.login_url
+        email = self.config.login_email
+        password = self.config.login_password
+
+        print(f"[LOGIN] Navigating to login page: {login_url}")
+        _flush()
+
+        try:
+            self._page.goto(login_url, wait_until="load", timeout=self.config.timeout * 1000)
+            time.sleep(5.0)
+
+            # Best-effort wait for full page render
+            try:
+                self._page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+            # Log how many inputs are on the page for diagnostics
+            all_inputs = self._page.query_selector_all("input")
+            print(f"[LOGIN] Page loaded. Found {len(all_inputs)} input element(s).")
+            _flush()
+
+            # --- Dismiss cookie consent overlays ---
+            cookie_selectors = [
+                'button:has-text("Accept All Cookies")',
+                'button:has-text("Accept All")',
+                'button:has-text("Allow All")',
+                'button:has-text("Accept")',
+                '#onetrust-accept-btn-handler',
+            ]
+            for sel in cookie_selectors:
+                try:
+                    btn = self._page.query_selector(sel)
+                    if btn and btn.is_visible():
+                        btn.click()
+                        print("[LOGIN] Dismissed cookie consent dialog.")
+                        _flush()
+                        time.sleep(1.5)
+                        break
+                except Exception:
+                    continue
+
+            # --- Find and fill email/username field ---
+            email_selectors = [
+                'input[name="email"]',
+                'input[type="email"]',
+                'input[id*="email"]',
+                'input[autocomplete="email"]',
+                'input[name="username"]',
+                'input[id*="user"]',
+                'input[autocomplete="username"]',
+                'input[name*="email"]',
+                'input[name*="user"]',
+                'input[placeholder*="email" i]',
+                'input[placeholder*="user" i]',
+            ]
+            email_field = None
+
+            # Wait for the login form to appear (SPA may render it late)
+            for sel in email_selectors:
+                try:
+                    self._page.wait_for_selector(sel, timeout=3000)
+                    email_field = self._page.query_selector(sel)
+                    if email_field:
+                        print(f"[LOGIN] Found email field: {sel}")
+                        _flush()
+                        break
+                except Exception:
+                    continue
+
+            if not email_field:
+                # Fallback: try any visible text input
+                print("[LOGIN] Named selectors failed. Trying first visible text input.")
+                _flush()
+                for inp in self._page.query_selector_all('input[type="text"]'):
+                    if inp.is_visible():
+                        email_field = inp
+                        break
+
+            if email_field:
+                email_field.click()
+                email_field.fill(email)
+                print(f"[LOGIN] Filled email: {email}")
+                _flush()
+            else:
+                print("[LOGIN] ERROR: No email/username input found on login page.")
+                _flush()
+                return
+
+            # --- Find and fill password field ---
+            pw_field = self._page.query_selector('input[type="password"]')
+            if pw_field:
+                pw_field.click()
+                pw_field.fill(password)
+                print("[LOGIN] Filled password: ****")
+                _flush()
+            else:
+                print("[LOGIN] ERROR: No password input found on login page.")
+                _flush()
+                return
+
+            # --- Find and click submit button ---
+            submit_selectors = [
+                'button[type="submit"]',
+                'input[type="submit"]',
+                'button:has-text("Log in")',
+                'button:has-text("Login")',
+                'button:has-text("Sign in")',
+                'button:has-text("Sign In")',
+                'button:has-text("Submit")',
+                '[role="button"]:has-text("Log in")',
+                '[role="button"]:has-text("Login")',
+            ]
+            submit_btn = None
+            for sel in submit_selectors:
+                submit_btn = self._page.query_selector(sel)
+                if submit_btn:
+                    break
+
+            if submit_btn:
+                submit_btn.click()
+                print("[LOGIN] Clicked submit button.")
+                _flush()
+            else:
+                # Fallback: press Enter on the password field
+                pw_field.press("Enter")
+                print("[LOGIN] No submit button found; pressed Enter on password field.")
+                _flush()
+
+            # --- Wait for login to complete ---
+            # Wait for navigation away from the login URL
+            time.sleep(3.0)
+            try:
+                self._page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+
+            current_url = self._page.url
+            if "login" in current_url.lower() or "auth" in current_url.lower():
+                # Still on login page - wait a bit more
+                time.sleep(5.0)
+                current_url = self._page.url
+
+            login_path = "/login" in current_url.lower() or "/signin" in current_url.lower()
+            if login_path:
+                print(f"[LOGIN] WARNING: May still be on login page: {current_url}")
+                print("[LOGIN] Proceeding anyway - authentication cookies may have been set.")
+                _flush()
+            else:
+                print(f"[LOGIN] Success! Redirected to: {current_url}")
+                _flush()
+
+        except Exception as e:
+            print(f"[LOGIN] ERROR: Login failed: {e}")
+            _flush()
+
+    def _transfer_browser_cookies(self) -> None:
+        """Copy cookies from the Playwright browser context to the requests session.
+
+        This allows subsequent pages to be fetched via fast HTTP (requests)
+        instead of slow browser navigation, while keeping the authenticated state.
+        """
+        if self._browser_context is None:
+            return
+
+        cookies = self._browser_context.cookies()
+        for c in cookies:
+            self.session.cookies.set(
+                name=c["name"],
+                value=c["value"],
+                domain=c.get("domain", ""),
+                path=c.get("path", "/"),
+            )
+        print(f"[AUTH] Transferred {len(cookies)} cookie(s) to HTTP session.")
+        _flush()
+
+    def _grab_toc_links(self, html: str) -> list[str]:
+        """Extract all hrefs from the TOC container in the rendered HTML.
+
+        Instead of clicking/expanding TOC nodes one by one (slow), this grabs
+        the container's innerHTML and uses regex to find all href attributes.
+        SPA TOC trees typically have all links in the DOM even when visually
+        collapsed -- they are just hidden via CSS.
+
+        Returns:
+            List of raw href strings found inside the container.
+        """
+        import re
+
+        if not self.config.limitation_type or not self.config.limitation_text:
+            return []
+
+        attr = self.config.limitation_type
+        val = self.config.limitation_text
+
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html, "html.parser")
+
+        # Find the container using BeautifulSoup (handles multi-class)
+        container = soup.find("div", attrs={attr: lambda v: v and val in (v if isinstance(v, list) else v.split())})
+        if not container:
+            # Fallback: try any element with the attribute
+            container = soup.find(attrs={attr: lambda v: v and val in (v if isinstance(v, list) else v.split())})
+
+        if not container:
+            print(f"  [TOC] Container not found for {attr}='{val}' in HTML")
+            _flush()
+            return []
+
+        container_html = str(container)
+        # Regex: find all href="..." values in the container HTML
+        # Match group 1: the href value (single or double quotes)
+        #   href=       - literal href=
+        #   ["']        - opening quote
+        #   ([^"']+)    - capture group: one or more chars that aren't quotes
+        #   ["']        - closing quote
+        hrefs = re.findall(r'href=["\']([^"\']+)["\']', container_html)
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for h in hrefs:
+            if h not in seen and not h.startswith(("#", "javascript:", "mailto:")):
+                seen.add(h)
+                unique.append(h)
+
+        print(f"  [TOC] Grabbed {len(unique)} unique link(s) from container ({attr}='{val}')")
+        _flush()
+        return unique
+
     def _expand_toc_tree(self) -> None:
-        """Expand all collapsed TOC tree nodes inside the limitation container.
+        """Legacy TOC expansion via clicking -- only used when no TOC links
+        were found by _grab_toc_links (fallback for sites that truly lazy-load).
 
-        Uses limitation_type and limitation_text from config to locate the
-        container div (e.g. div[aria-label="TOC navigation"]), then iteratively
-        clicks all collapsed nodes (aria-expanded="false") within it until the
-        entire tree is visible.  Only runs on the original input address.
-
-        The container is re-queried each round because clicking a node may
-        update the DOM (SPA navigation), invalidating previous references.
+        Uses limitation_type/limitation_text to locate the container, then
+        clicks all [aria-expanded="false"] nodes to reveal hidden links.
         """
         if self._page is None:
             return
         if not self.config.limitation_type or not self.config.limitation_text:
             return
 
-        # Build CSS selector for the container div
         attr = self.config.limitation_type
         val = self.config.limitation_text
-        container_sel = f'div[{attr}="{val}"]'
+        if attr == "class":
+            container_sel = f'div[{attr}~="{val}"]'
+        else:
+            container_sel = f'div[{attr}="{val}"]'
 
         container = self._page.query_selector(container_sel)
         if not container:
@@ -186,20 +459,17 @@ class Crawler:
             _flush()
             return
 
-        print(f"  [TOC] Found container: {container_sel}")
-        print("  [TOC] Expanding tree nodes to discover all topic links...")
+        print(f"  [TOC] Falling back to click-expansion for: {container_sel}")
         _flush()
 
-        max_rounds = 80  # Safety limit
+        max_rounds = 80
         total_expanded = 0
 
         for round_num in range(1, max_rounds + 1):
-            # Re-query the container each round (DOM may have changed)
             container = self._page.query_selector(container_sel)
             if not container:
                 break
 
-            # Find collapsed nodes inside the container
             collapsed = container.query_selector_all('[aria-expanded="false"]')
             if not collapsed:
                 break
@@ -210,24 +480,21 @@ class Crawler:
                     node.scroll_into_view_if_needed(timeout=2000)
                     node.click(timeout=2000)
                     expanded_this_round += 1
-                    # Brief pause between clicks to let children load
                     time.sleep(0.3)
                 except Exception:
                     continue
 
             total_expanded += expanded_this_round
-
             if expanded_this_round == 0:
                 break
 
-            # Wait for children to load after this round
             time.sleep(1.5)
             print(f"  [TOC] Round {round_num}: expanded {expanded_this_round} nodes "
                   f"(total: {total_expanded})")
             _flush()
 
         time.sleep(2.0)
-        print(f"  [TOC] Tree expansion complete. {total_expanded} nodes expanded.")
+        print(f"  [TOC] Click-expansion complete. {total_expanded} nodes expanded.")
         _flush()
 
     def _is_pdf_url(self, url: str) -> bool:
@@ -300,9 +567,17 @@ class Crawler:
                 self._extract_links_from_file(filepath, url)
             return
 
-        # Download the page
-        if self.config.browser:
+        # Download the page.
+        # When login credentials are provided, keep using the browser for all
+        # pages because auth tokens may not transfer cleanly to requests.
+        # Otherwise, use the browser only for the first page (TOC grab),
+        # then switch to fast HTTP for the rest.
+        has_login = bool(self.config.login_url and self.config.login_email)
+        if self.config.browser and (has_login or not self._toc_expanded):
             html = self._download_browser(url)
+        elif self.config.browser and not has_login and self._toc_expanded:
+            # No login needed -- cookies transferred, use fast HTTP
+            html = self._download(url)
         else:
             html = self._download(url)
 
@@ -373,8 +648,13 @@ class Crawler:
                         return None
 
                 # Extra wait for JS to render dynamic content (SPA TOC trees, etc.)
-                if self.config.extra_wait > 0:
+                # Only use full extra_wait on the first page; subsequent pages
+                # just need the DOM to load (much faster).
+                is_input = url.rstrip("/") == self.config.input_address.rstrip("/")
+                if self.config.extra_wait > 0 and not self._toc_expanded:
                     time.sleep(self.config.extra_wait)
+                elif self._toc_expanded:
+                    time.sleep(min(self.config.extra_wait, 1.0))
 
                 # Best-effort secondary networkidle wait (short timeout)
                 try:
@@ -382,15 +662,31 @@ class Crawler:
                 except Exception:
                     pass  # Best effort - proceed with what we have
 
-                # On the original input address only, expand the TOC tree
-                # to discover all topic URLs before we start crawling
-                is_input = url.rstrip("/") == self.config.input_address.rstrip("/")
-                if is_input and not self._toc_expanded:
-                    self._expand_toc_tree()
-                    self._toc_expanded = True
-
                 # Get the fully rendered DOM (not the initial HTML source)
                 html = self._page.content()
+
+                # On the original input address, grab TOC links directly
+                # from the rendered HTML (fast regex) instead of clicking nodes
+                is_input = url.rstrip("/") == self.config.input_address.rstrip("/")
+                if is_input and not self._toc_expanded:
+                    toc_hrefs = self._grab_toc_links(html)
+                    if toc_hrefs:
+                        # Queue all TOC links immediately
+                        for href in toc_hrefs:
+                            resolved = resolve_url(url, href)
+                            if resolved and resolved not in self.queued:
+                                if is_in_scope(resolved, self.config.input_address):
+                                    self.queue.append(resolved)
+                                    self.queued.add(resolved)
+                                    print(f"    + {resolved}")
+                                    _flush()
+                        print(f"  [TOC] Queued {len(self.queue)} URLs from TOC")
+                        _flush()
+                    else:
+                        # Fallback: click-expand if no links found in static DOM
+                        self._expand_toc_tree()
+                    self._toc_expanded = True
+
                 return html
 
             except Exception as e:
@@ -546,29 +842,56 @@ class Crawler:
         return None
 
     def _extract_and_queue_links(self, html: str, page_url: str) -> None:
-        """Parse HTML, apply filters, extract links, and add new ones to queue.
+        """Parse HTML for links and add new in-scope ones to queue.
+
+        On the input page, uses the BeautifulSoup filter (limitation_type/text).
+        On all other pages, uses fast regex to find href attributes in the
+        full HTML source -- no DOM parsing overhead.
 
         Args:
             html: Raw HTML content.
             page_url: The URL this HTML was downloaded from (for resolving relative links).
         """
-        try:
-            soup = BeautifulSoup(html, "lxml")
-        except Exception:
-            # Fallback to html.parser if lxml fails
-            soup = BeautifulSoup(html, "html.parser")
+        import re
 
-        # Apply HTML filtering only on the original input address.
-        # All other pages use the full document for link extraction.
         is_input_page = page_url.rstrip("/") == self.config.input_address.rstrip("/")
-        filtered_elements = filter_html(
-            soup,
-            limitation_type=self.config.limitation_type if is_input_page else None,
-            limitation_text=self.config.limitation_text if is_input_page else None,
-        )
 
-        # Extract links from filtered content
-        hrefs = extract_links(filtered_elements, content_types=self.config.content_types)
+        if is_input_page and (self.config.limitation_type or self.config.limitation_text):
+            # First page: use BeautifulSoup with filter
+            try:
+                soup = BeautifulSoup(html, "lxml")
+            except Exception:
+                soup = BeautifulSoup(html, "html.parser")
+
+            filtered_elements = filter_html(
+                soup,
+                limitation_type=self.config.limitation_type,
+                limitation_text=self.config.limitation_text,
+            )
+            hrefs = extract_links(filtered_elements, content_types=self.config.content_types)
+        else:
+            # Subsequent pages: fast regex search on raw HTML
+            # Regex: href="..." or href='...'
+            #   href=       - literal href=
+            #   ["']        - opening quote
+            #   ([^"'#]+)   - capture: one or more chars, not quotes or fragment
+            #   [^"']*      - optional fragment
+            #   ["']        - closing quote
+            raw_hrefs = re.findall(r'href=["\']([^"\']+)["\']', html)
+            hrefs = []
+            for h in raw_hrefs:
+                h = h.split("#")[0].strip()
+                if not h or h.startswith(("javascript:", "mailto:", "data:")):
+                    continue
+                # Filter by content type
+                if self.config.content_types == "pdf":
+                    if h.lower().endswith(".pdf"):
+                        hrefs.append(h)
+                elif self.config.content_types == "html":
+                    if not h.lower().endswith(".pdf"):
+                        hrefs.append(h)
+                else:
+                    hrefs.append(h)
 
         new_count = 0
         for href in hrefs:
@@ -576,7 +899,7 @@ class Crawler:
             if not resolved:
                 continue
 
-            if resolved in self.visited:
+            if resolved in self.queued:
                 continue
 
             # PDF links may point to external CDN domains — skip scope check for PDFs
@@ -586,15 +909,15 @@ class Crawler:
                     print(f"  [OUT-OF-SCOPE] {resolved}")
                 continue
 
-            # Avoid adding duplicates to the queue
-            if resolved not in self.visited:
-                self.queue.append(resolved)
-                new_count += 1
+            self.queue.append(resolved)
+            self.queued.add(resolved)
+            new_count += 1
+            if self.config.verbose:
                 print(f"    + {resolved}")
-                _flush()
+            _flush()
 
         if new_count > 0:
-            print(f"  [LINKS] Found {len(hrefs)} links, queued {new_count} new in-scope URLs")
+            print(f"  [LINKS] Queued {new_count} new in-scope URLs (from {len(hrefs)} hrefs)")
             _flush()
         elif self.config.verbose:
             print(f"  [LINKS] Found {len(hrefs)} links, none new in-scope")
@@ -622,6 +945,7 @@ class Crawler:
         print("  Crawl Complete")
         print(f"  Pages saved:   {self.saved_count}")
         print(f"  Pages visited: {len(self.visited)}")
+        print(f"  Unique URLs:   {len(self.queued)}")
         print(f"  Pages failed:  {len(self.failed)}")
         print(f"  Output folder: {self.config.output_folder}")
         print("=" * 70)

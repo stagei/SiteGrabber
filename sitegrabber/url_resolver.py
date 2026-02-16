@@ -169,19 +169,26 @@ def is_in_scope(url: str, base_url: str) -> bool:
     if url_parsed.scheme not in ("http", "https"):
         return False
 
-    # Path must start with base path
+    # Path must fall under the base path scope.
+    # If the base path looks like a file (has an extension like .html),
+    # use its parent directory as the scope instead, so sibling pages match.
     base_path = base_parsed.path.rstrip("/")
     url_path = url_parsed.path
 
+    # Detect file-like base path and use parent directory as scope
+    import posixpath
+    _, ext = posixpath.splitext(base_path)
+    if ext in (".html", ".htm", ".php", ".asp", ".aspx", ".jsp"):
+        base_path = posixpath.dirname(base_path)
+
     # The URL path should start with the base path
-    # /docs/en/db2/12.1.x?topic=foo is within /docs/en/db2/12.1.x
     if not url_path.startswith(base_path):
         return False
 
     # Ensure it's a true prefix (not just partial match)
     # /docs/en/db2/12.1.x-extra should NOT match /docs/en/db2/12.1.x
     remaining = url_path[len(base_path):]
-    if remaining and not remaining.startswith("/") and not remaining == "":
+    if remaining and not remaining.startswith("/") and remaining != "":
         return False
 
     return True

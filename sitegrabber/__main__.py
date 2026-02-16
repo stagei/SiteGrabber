@@ -139,6 +139,25 @@ Examples:
         help="What to download: html (default), pdf (only PDF links), all (both HTML pages and PDF files).",
     )
 
+    parser.add_argument(
+        "--login-url",
+        default=None,
+        help="URL of the login page. When set, the browser navigates here first and authenticates "
+             "before crawling. Requires --browser, --login-email, and --login-password.",
+    )
+
+    parser.add_argument(
+        "--login-email",
+        default=None,
+        help="Email or username for login.",
+    )
+
+    parser.add_argument(
+        "--login-password",
+        default=None,
+        help="Password for login.",
+    )
+
     args = parser.parse_args(argv)
 
     return CrawlConfig(
@@ -156,6 +175,9 @@ Examples:
         wait_for=args.wait_for,
         extra_wait=args.extra_wait,
         content_types=args.content_types,
+        login_url=args.login_url,
+        login_email=args.login_email,
+        login_password=args.login_password,
     )
 
 
